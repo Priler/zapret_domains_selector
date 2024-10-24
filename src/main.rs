@@ -16,72 +16,152 @@ use crossterm::{
 struct FileEntry {
     name: String,
     selected: bool,
+    is_control: bool,
 }
 
+const VISIBLE_ITEMS: usize = 15;
+const HEADER_LINES: usize = 5; // Header text + empty line + control buttons + empty line + separator
+const SCROLL_AREA_HEIGHT: usize = VISIBLE_ITEMS + 2; // +2 for scroll indicators
+
 fn main() -> io::Result<()> {
-    // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
 
     let result = run_app(&mut stdout);
 
-    // Cleanup terminal
     execute!(stdout, Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     result
 }
 
-fn draw_screen(stdout: &mut io::Stdout, entries: &[FileEntry], current_index: usize, clear_screen: bool) -> io::Result<()> {
+fn draw_screen(
+    stdout: &mut io::Stdout,
+    entries: &[FileEntry],
+    current_index: usize,
+    scroll_offset: usize,
+    clear_screen: bool
+) -> io::Result<()> {
     if clear_screen {
-        queue!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-    } else {
-        queue!(stdout, cursor::MoveTo(0, 0))?;
+        queue!(stdout, terminal::Clear(ClearType::All))?;
     }
 
-    // Header
-    writeln!(stdout, "Используйте ↑↓ для навигации, ПРОБЕЛ или ENTER для выбора, ENTER на СОХРАНИТЬ/ОТМЕНА для завершения\n")?;
+    queue!(stdout, cursor::MoveTo(0, 0))?;
 
-    // File list
-    for (index, entry) in entries.iter().enumerate() {
+    // Header section
+    writeln!(stdout, "Используйте ↑↓ для навигации, ПРОБЕЛ или ENTER для выбора\n")?;
+
+    // Draw control options first
+    let control_entries: Vec<_> = entries.iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_control)
+        .collect();
+
+    for (index, entry) in &control_entries {
         let name = if entry.name == "SAVE LIST" {
-            "СОХРАНИТЬ СПИСОК".to_string()
-        } else if entry.name == "CANCEL" {
-            "ОТМЕНА".to_string()
+            "СОХРАНИТЬ СПИСОК"
         } else {
-            entry.name.clone()
+            "ОТМЕНА"
         };
 
         let line = format!(
-            "{} [{}] {}",
-            if index == current_index { ">" } else { " " },
-            if entry.selected { "*" } else { " " },
+            "{}  {}",
+            if *index == current_index { ">" } else { " " },
             name
         );
 
-        if index == current_index {
+        if *index == current_index {
             writeln!(stdout, "{}", line.reverse())?;
         } else {
             writeln!(stdout, "{}", line)?;
         }
     }
 
+    writeln!(stdout)?; // Extra empty line after control options
+    writeln!(stdout)?; // Separator line
+
+    // Clear the scroll area
+    for _ in 0..SCROLL_AREA_HEIGHT {
+        writeln!(stdout, "{}", " ".repeat(50))?; // Clear line with spaces
+    }
+
+    // Move back to start of scroll area
+    queue!(stdout, cursor::MoveTo(0, HEADER_LINES as u16))?;
+
+    // Get file entries (non-control entries)
+    let file_entries: Vec<_> = entries.iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_control)
+        .collect();
+
+    let total_files = file_entries.len();
+    let visible_end = scroll_offset.saturating_add(VISIBLE_ITEMS).min(total_files);
+
+    // Show scroll indicator if needed
+    if scroll_offset > 0 {
+        writeln!(stdout, " ↑ Прокрутите вверх для большего количества файлов")?;
+    } else {
+        writeln!(stdout)?; // Keep spacing consistent
+    }
+
+    // Draw visible file entries
+    let visible_entries = &file_entries[scroll_offset..visible_end];
+    for entry in visible_entries {
+        let real_index = entries.iter().position(|e| e.name == entry.1.name).unwrap();
+        let line = format!(
+            "{} {} {}",
+            if real_index == current_index { ">" } else { " " },
+            if entry.1.selected { "[*]" } else { "[ ]" },
+            entry.1.name
+        );
+
+        if real_index == current_index {
+            writeln!(stdout, "{}", line.reverse())?;
+        } else {
+            writeln!(stdout, "{}", line)?;
+        }
+    }
+
+    // Move to the bottom scroll indicator position
+    queue!(stdout, cursor::MoveTo(0, (HEADER_LINES + VISIBLE_ITEMS + 1) as u16))?;
+
+    // Show scroll indicator if needed
+    if visible_end < total_files {
+        writeln!(stdout, " ↓ Прокрутите вниз для большего количества файлов")?;
+    }
+
     stdout.flush()
 }
 
+fn join_selected_files(lists_dir: &Path, selected_entries: &[&FileEntry]) -> io::Result<()> {
+    let ultimate_path = lists_dir.join("list-ultimate.txt");
+    let mut ultimate_file = File::create(ultimate_path)?;
+
+    for entry in selected_entries {
+        let file_path = lists_dir.join(&entry.name);
+        if file_path.exists() {
+            let mut content = String::new();
+            File::open(&file_path)?.read_to_string(&mut content)?;
+
+            // Write filename as a header
+            // writeln!(ultimate_file, "// === {} ===", entry.name)?;
+            // Write the content
+            writeln!(ultimate_file, "{}", content.trim())?;
+            // Add a separator
+            // writeln!(ultimate_file)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
-    // Ensure lists directory exists
     let lists_dir = Path::new("lists");
     if !lists_dir.exists() {
         fs::create_dir(lists_dir)?;
     }
 
-    // Read previously selected files
     let config_path = lists_dir.join("selected.txt");
     let mut selected_files = Vec::new();
     if config_path.exists() {
@@ -90,18 +170,32 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
         selected_files = content.lines().map(String::from).collect();
     }
 
-    // Get list of txt files
-    let mut entries: Vec<FileEntry> = fs::read_dir(lists_dir)?
+    // Create control entries first
+    let mut entries = vec![
+        FileEntry {
+            name: String::from("SAVE LIST"),
+            selected: false,
+            is_control: true,
+        },
+        FileEntry {
+            name: String::from("CANCEL"),
+            selected: false,
+            is_control: true,
+        },
+    ];
+
+    // Add file entries
+    let mut file_entries: Vec<FileEntry> = fs::read_dir(lists_dir)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().into_string().ok()?;
             if name.starts_with("list-") &&
                 name.ends_with(".txt") &&
                 name != "list-ultimate.txt" {
-                let selected = selected_files.contains(&name);
                 Some(FileEntry {
                     name: name.clone(),
-                    selected,
+                    selected: selected_files.contains(&name),
+                    is_control: false,
                 })
             } else {
                 None
@@ -109,25 +203,15 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
         })
         .collect();
 
-    // Sort entries alphabetically
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // Add special options
-    entries.push(FileEntry {
-        name: String::from("SAVE LIST"),
-        selected: false,
-    });
-    entries.push(FileEntry {
-        name: String::from("CANCEL"),
-        selected: false,
-    });
+    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.extend(file_entries);
 
     let mut current_index = 0;
+    let mut scroll_offset = 0;
+    let num_control_entries = entries.iter().filter(|e| e.is_control).count();
 
-    // Initial draw with full clear
-    draw_screen(stdout, &entries, current_index, true)?;
+    draw_screen(stdout, &entries, current_index, scroll_offset, true)?;
 
-    // Main event loop
     'main: loop {
         if let Ok(true) = event::poll(Duration::from_millis(16)) {
             if let Ok(Event::Key(key)) = event::read() {
@@ -141,6 +225,12 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
                     } => {
                         if current_index > 0 {
                             current_index -= 1;
+                            if current_index >= num_control_entries {
+                                let file_index = current_index - num_control_entries;
+                                if scroll_offset > file_index {
+                                    scroll_offset = file_index;
+                                }
+                            }
                         }
                     }
                     KeyEvent {
@@ -150,6 +240,12 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
                     } => {
                         if current_index < entries.len() - 1 {
                             current_index += 1;
+                            if current_index >= num_control_entries {
+                                let file_index = current_index - num_control_entries;
+                                if file_index >= scroll_offset + VISIBLE_ITEMS {
+                                    scroll_offset = file_index - VISIBLE_ITEMS + 1;
+                                }
+                            }
                         }
                     }
                     KeyEvent {
@@ -157,32 +253,43 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
                         kind: event::KeyEventKind::Press,
                         ..
                     } => {
-                        // Special handling for SAVE and CANCEL
-                        if current_index >= entries.len() - 2 {
-                            match entries[current_index].name.as_str() {
-                                "SAVE LIST" => {
-                                    let mut file = File::create(&config_path)?;
-                                    for entry in &entries {
-                                        if entry.selected {
-                                            writeln!(file, "{}", entry.name)?;
-                                        }
-                                    }
+                        match entries[current_index].name.as_str() {
+                            "SAVE LIST" => {
+                                // Save selected files to config
+                                let mut file = File::create(&config_path)?;
+                                let selected_entries: Vec<_> = entries.iter()
+                                    .filter(|e| e.selected && !e.is_control)
+                                    .collect();
+
+                                for entry in &selected_entries {
+                                    writeln!(file, "{}", entry.name)?;
+                                }
+
+                                // Join selected files into list-ultimate.txt
+                                if let Err(e) = join_selected_files(lists_dir, &selected_entries) {
                                     execute!(
                                         stdout,
                                         cursor::MoveToNextLine(1),
                                         terminal::Clear(ClearType::FromCursorDown)
                                     )?;
-                                    println!("{}", "Успешно! Список сохранен. Выход через 5 секунд...".green());
-                                    stdout.flush()?;
-                                    thread::sleep(Duration::from_secs(5));
-                                    break 'main Ok(());
+                                    println!("{}", format!("Ошибка при объединении файлов: {}. Выход через 5 секунд...", e).red());
+                                } else {
+                                    execute!(
+                                        stdout,
+                                        cursor::MoveToNextLine(1),
+                                        terminal::Clear(ClearType::FromCursorDown)
+                                    )?;
+                                    println!("{}", "Успешно! Список сохранен и файлы объединены. Выход через 5 секунд...".green());
                                 }
-                                "CANCEL" => break 'main Ok(()),
-                                _ => {}
+
+                                stdout.flush()?;
+                                thread::sleep(Duration::from_secs(5));
+                                break 'main Ok(());
                             }
-                        } else {
-                            // Toggle selection for regular items
-                            entries[current_index].selected = !entries[current_index].selected;
+                            "CANCEL" => break 'main Ok(()),
+                            _ => {
+                                entries[current_index].selected = !entries[current_index].selected;
+                            }
                         }
                     }
                     KeyEvent {
@@ -199,7 +306,7 @@ fn run_app(stdout: &mut io::Stdout) -> io::Result<()> {
                 }
 
                 if redraw {
-                    draw_screen(stdout, &entries, current_index, false)?;
+                    draw_screen(stdout, &entries, current_index, scroll_offset, false)?;
                 }
             }
         }
